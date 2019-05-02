@@ -1,0 +1,190 @@
+#include "FloaterThread.h"
+#include "Analysis.h"
+
+#include "DefineColor.h"
+
+#include <unistd.h>
+#include <sys/time.h>
+#include <glog/logging.h>
+
+static std::vector<cv::Point>  getObjectRect(cv::Mat &srcImg, cv::Scalar &color, std::vector<cv::Rect> &result_floater,double &velocityvalue);
+static cv::Rect RiverRect(cv::Mat srcImg,const cv::Scalar& color, std::vector<cv::Point>& contoursriverresult);
+static int getfloater(cv::Mat &segMat,const cv::Scalar& float_color,const cv::Scalar & water_color, std::vector<cv::Rect> &result, double &velocityvalue, int &totall);
+
+
+FloaterThread::FloaterThread(Analysis* analysis_manager) 
+    : manager(analysis_manager) {
+
+}
+
+void FloaterThread::Run() {
+    std::lock_guard<std::mutex> lk(_mutex);
+    LOG(INFO) << "FloaterThread start";
+    _is_run = true;
+    uint32_t interval = config.detect_interval() * 1000;
+    while(_is_run) {
+        cv::Mat originMat = manager->GetOriginImg();
+        cv::Mat segMat = manager->GetSegmentImg();
+        if (originMat.empty() || segMat.empty()) {
+            usleep(interval);
+            continue;
+        }
+
+#ifdef _DEBUG
+        if (config.has_display() && config.display()) {
+            std::string window_name = std::to_string(manager->Config().video_id());
+            std::string origin_name = window_name + std::string("_FloaterThread_origin");
+            std::string segment_name = window_name + std::string("_FloaterThread_segment");
+            cv::imshow(origin_name, originMat);
+            cv::imshow(segment_name, segMat);
+            cv::waitKey(1);
+        }
+#endif
+        cv::resize(originMat, originMat, segMat.size());
+
+        std::vector<cv::Rect> resultrect;
+        double speed = 0.0;
+        int area = 0;
+        int state = getfloater(segMat, FLOATER_COLOR, WATER_COLOR, resultrect, speed, area);
+        if (state != 0 || resultrect.empty()) {
+            usleep(interval);
+            SetAlarm(false, 0, 0);
+            continue;
+        } else {
+            SetAlarm(true, area, speed);
+        }
+        usleep(interval);
+	}
+    LOG(INFO) << "FloaterThread end";
+    _is_run = false;
+    CallStop();
+}
+
+AnalysisAlarm FloaterThread::GetAlarm() {
+    std::lock_guard<std::mutex> lk(alarm_mutex);
+    AnalysisAlarm res = alarm;
+    alarm.set_is_active(false);
+    return res;
+}
+
+void FloaterThread::SetAlarm(bool is_active, float area, float speed) {
+    std::lock_guard<std::mutex> lk(alarm_mutex);
+    alarm.set_is_active(is_active);
+    if (!is_active) {
+        alarm.set_floater_area(0);
+        alarm.set_floater_speed(0);
+    } else {
+        alarm.set_floater_area(area);
+        alarm.set_floater_speed(speed);
+    }
+}
+
+std::vector<cv::Point>  getObjectRect(cv::Mat &srcImg,const cv::Scalar &color,std::vector<cv::Rect> &result_floater, double& velocityvalue)
+{
+	cv::Mat segImg;
+	std::vector<cv::Point> contourRectcenter, contourRect;
+	std::vector<std::vector<cv::Point> > contours;
+	std::vector<cv::Vec4i> hierarchy;
+
+	inRange(srcImg, color, color, segImg);
+
+	threshold(segImg, segImg, 200, 255, CV_THRESH_OTSU);//自适应二值化
+	cv::Mat dstImage;
+	findContours(segImg, contours, hierarchy, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE, cv::Point());
+	for (size_t i = 0; i < contours.size(); i++)
+	{
+		if (contours[i].size() > 25)
+		{
+			//绘制轮廓的最小外接矩形  
+			cv::RotatedRect rect = minAreaRect(contours[i]);
+			cv::Point A, B, C, D;
+			/*contourRectcenter.push_back(rect.center);*/
+			rectangle(srcImg, rect.boundingRect(), cv::Scalar(0, 0, 255));
+			A.x = rect.boundingRect().x;
+			A.y = rect.boundingRect().y;
+			B.x = rect.boundingRect().x + rect.boundingRect().width;
+			B.y = rect.boundingRect().y ;
+			C.x= rect.boundingRect().x;
+			C.y = rect.boundingRect().y+rect.boundingRect().height;
+			D.x = rect.boundingRect().x + rect.boundingRect().width;
+			D.y = rect.boundingRect().y + rect.boundingRect().height;
+			contourRect.push_back(A);
+			contourRect.push_back(B);
+			contourRect.push_back(C);
+			contourRect.push_back(D);
+			result_floater.push_back(rect.boundingRect());
+			//旋转矩形
+		}
+	}
+	return contourRect;
+}
+cv::Rect RiverRect(cv::Mat srcImg,const cv::Scalar& color, std::vector<cv::Point>& contoursriverresult)
+{
+	cv::Mat segImg;
+	std::vector<cv::Point> contourRect;
+	std::vector<std::vector<cv::Point> > contours;
+	std::vector<cv::Vec4i> hierarchy;
+
+	inRange(srcImg, color, color, segImg);
+	cv::threshold(segImg, segImg, 200, 255, CV_THRESH_OTSU);
+	cv::Mat riverimage = segImg;
+	cv::Mat dstImage;
+	int k = -1;
+	cv::RotatedRect rectresult;
+
+	findContours(segImg, contours, hierarchy, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE, cv::Point());
+	if (contours.empty())
+		return cv::Rect(0, 0, 0, 0);
+	for (size_t i = 0; i < contours.size(); i++)
+	{
+		if (contours[i].size() > 50)
+		{
+			size_t maxarea = 100;
+			if (contours[i].size() > maxarea)
+			{
+				maxarea = contours[i].size();
+				k = i;
+			}
+		}
+	}
+	if (k == -1)
+		return cv::Rect();
+	contoursriverresult = contours[k];
+	rectresult = minAreaRect(contoursriverresult);
+	rectangle(srcImg, rectresult.boundingRect(), cv::Scalar(0, 0, 255));
+	return rectresult.boundingRect();
+}
+int getfloater(cv::Mat &segMat,const cv::Scalar &floater,const cv::Scalar &water, std::vector<cv::Rect> &result, double& velocityvalue, int& totall)
+{
+	std::vector<cv::Rect> floaterrect;
+	std::vector<cv::Point> float_point_vec = getObjectRect(segMat, floater, floaterrect, velocityvalue);
+	std::vector<cv::Point> counter_max;
+	result.clear();
+	RiverRect(segMat, water, counter_max);
+
+	if (float_point_vec.size() != 0 && counter_max.size() != 0)
+	{
+        for (size_t j = 0; j < floaterrect.size(); ++j) {
+            
+            cv::Rect& rect = floaterrect[j];
+            bool istrue = false;
+            for (size_t k = 4*j; k < 4*(j+1); ++k) {
+			    double ditance = pointPolygonTest(counter_max, float_point_vec[k], true);
+                if (ditance > 0) {
+                    istrue = true;
+                    break;
+                }
+            }
+            if (istrue) {
+                result.push_back(rect);
+                totall += rect.width * rect.height; 
+            }
+        }
+	}
+	if (!result.empty())
+	{
+		return 0;
+	}
+	return -1;
+}
+
